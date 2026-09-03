@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover">
+<title>Awadh Saw Mill</title>
+<meta name="theme-color" content="#12352a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Awadh Saw Mill">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="app-bar">
+      <div class="app-logo">ASM</div>
+      <div class="app-bar-text">
+        <div class="eyebrow">Timber &amp; Sawmill</div>
+        <h1>Awadh Saw Mill</h1>
+      </div>
+    </div>
+  </header>
+
+  <!-- ===================== ESTIMATE TAB ===================== -->
+  <div id="tab-estimate" class="tab-panel">
+
+    <div class="stepper" id="stepper">
+      <div class="step" data-step="1"><span class="dot">1</span><span>Customer</span></div>
+      <div class="step-line"></div>
+      <div class="step" data-step="2"><span class="dot">2</span><span>Estimate</span></div>
+      <div class="step-line"></div>
+      <div class="step" data-step="3"><span class="dot">3</span><span>Challan</span></div>
+    </div>
+
+    <div class="gate-panel" id="gatePanel">
+      <div class="panel-title">Customer Details</div>
+      <p class="panel-sub">Enter a valid 10-digit mobile number to begin a new estimate.</p>
+      <div class="gate-fields">
+        <div class="field">
+          <label for="gatePhone">Mobile number <span class="req">*</span></label>
+          <input type="tel" id="gatePhone" inputmode="numeric" maxlength="10" placeholder="10-digit mobile number">
+          <div class="field-hint" id="gatePhoneHint">Enter 10 digits, e.g. 9876543210</div>
+        </div>
+        <div class="field">
+          <label for="gateName">Customer name <span class="optional">(optional)</span></label>
+          <input type="text" id="gateName" placeholder="e.g. Rakesh Verma">
+        </div>
+      </div>
+      <button class="btn-primary" id="gateBeginBtn" disabled>Begin Estimate</button>
+    </div>
+
+    <div id="mainContent">
+      <div class="panel">
+        <div class="panel-title">Default Rates</div>
+        <p class="panel-sub">Applied automatically when length ≤ 7ft and thickness ≤ 4in. Outside that range, you'll be asked to enter a rate for that piece.</p>
+        <div class="rates-grid" id="ratesGrid"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Add Piece</div>
+        <div class="meta-row">
+          <div class="field">
+            <label for="itemName">Description</label>
+            <input type="text" id="itemName" placeholder="e.g. Door frame">
+          </div>
+          <div class="field">
+            <label for="woodType">Wood</label>
+            <select id="woodType">
+              <option value="teak">Teak</option>
+              <option value="sal">Sal</option>
+              <option value="bija">Bija</option>
+              <option value="khamhar">Khamhar</option>
+              <option value="others">Others</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="itemQty">Qty</label>
+            <input type="number" id="itemQty" min="1" step="1" value="1">
+          </div>
+        </div>
+
+        <div class="dims-grid">
+          <div class="dim-block">
+            <div class="dim-label">Length</div>
+            <div class="dim-inputs">
+              <div class="field"><input type="number" id="lenFt" min="0" step="1" placeholder="0"><span class="unit">ft</span></div>
+              <div class="field"><input type="number" id="lenIn" min="0" max="11" step="0.1" placeholder="0"><span class="unit">in</span></div>
+            </div>
+          </div>
+          <div class="dim-block">
+            <div class="dim-label">Width</div>
+            <div class="dim-inputs">
+              <div class="field"><input type="number" id="widFt" min="0" step="1" placeholder="0"><span class="unit">ft</span></div>
+              <div class="field"><input type="number" id="widIn" min="0" max="11" step="0.1" placeholder="0"><span class="unit">in</span></div>
+            </div>
+          </div>
+          <div class="dim-block">
+            <div class="dim-label">Thickness</div>
+            <div class="dim-inputs">
+              <div class="field"><input type="number" id="hgtFt" min="0" step="1" placeholder="0"><span class="unit">ft</span></div>
+              <div class="field"><input type="number" id="hgtIn" min="0" max="11" step="0.1" placeholder="0"><span class="unit">in</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="rate-status" id="rateStatus">
+          <span class="status-text" id="rateStatusText">Select wood and enter dimensions</span>
+          <div class="rate-input-group">
+            <span>₹/CFT</span>
+            <input type="number" id="itemRate" min="0" step="1" placeholder="0">
+          </div>
+        </div>
+
+        <div class="live-calc">
+          <span id="liveCft">0.000 CFT × 1 pc</span>
+          <b id="liveCost">₹0.00</b>
+        </div>
+
+        <button class="btn-primary" id="addBtn">Add to Estimate</button>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Estimate</div>
+        <div class="customer-strip" id="customerStrip">
+          <div class="info">Customer: <b id="stripName"></b> &nbsp; <span id="stripPhone"></span></div>
+          <button id="changeCustomerBtn">Change customer</button>
+        </div>
+        <div class="inline-field-row">
+          <label for="makingChargesInput">Making charges (₹)</label>
+          <input type="number" id="makingChargesInput" min="0" step="1" value="0">
+        </div>
+        <div id="ledgerArea"><div class="loading">Add pieces above to build the estimate…</div></div>
+      </div>
+    </div>
+
+    <div id="challanView">
+      <div class="challan-card">
+        <div class="challan-head">
+          <div>
+            <h2>Delivery Challan</h2>
+            <div class="meta" id="challanMeta"></div>
+          </div>
+          <div class="party">
+            <span>Customer</span>
+            <b id="challanCustomerName"></b><br>
+            <span id="challanCustomerPhone"></span>
+          </div>
+        </div>
+        <div class="table-scroll"><table id="challanTable"></table></div>
+        <div class="totals-breakdown" id="challanBreakdown"></div>
+        <div class="challan-grid">
+          <div class="challan-field">
+            <label for="advancePaid">Advance paid (₹)</label>
+            <input type="number" id="advancePaid" min="0" step="1" value="0">
+          </div>
+          <div class="challan-field">
+            <label for="deliveryDate">Delivery date</label>
+            <input type="date" id="deliveryDate">
+          </div>
+        </div>
+        <div class="balance-box">
+          <span class="label">Balance Due</span>
+          <span class="value" id="balanceValue">₹0.00</span>
+        </div>
+        <div class="inline-field-row" id="challanOwnerEmailRow">
+          <label for="challanOwnerEmail">Owner email (for confirmation)</label>
+          <input type="email" id="challanOwnerEmail" placeholder="owner@example.com">
+        </div>
+        <div class="action-row">
+          <button class="btn-whatsapp" id="challanShareBtn">Share Challan via WhatsApp</button>
+          <button class="btn-confirm" id="challanEmailBtn">Email Challan to Owner</button>
+        </div>
+        <div class="clear-row"><button id="backToEstimateBtn">&larr; Back to Estimate</button></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ===================== PAYROLL TAB ===================== -->
+  <div id="tab-payroll" class="tab-panel" style="display:none;">
+
+    <div class="panel">
+      <div class="panel-title">Add Employee</div>
+      <div class="meta-row">
+        <div class="field">
+          <label for="empName">Name</label>
+          <input type="text" id="empName" placeholder="e.g. Suresh Kumar">
+        </div>
+        <div class="field">
+          <label for="empRole">Role</label>
+          <input type="text" id="empRole" placeholder="e.g. Sawyer">
+        </div>
+        <div class="field">
+          <label for="empPhone">Phone</label>
+          <input type="tel" id="empPhone" inputmode="numeric" maxlength="10" placeholder="10-digit">
+        </div>
+      </div>
+      <div class="meta-row" style="grid-template-columns:1fr;">
+        <div class="field">
+          <label for="empSalary">Monthly salary (₹)</label>
+          <input type="number" id="empSalary" min="0" step="1" placeholder="e.g. 15000">
+        </div>
+      </div>
+      <button class="btn-primary" id="addEmployeeBtn">Add Employee</button>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Mark Attendance</div>
+      <div class="meta-row" style="grid-template-columns:1fr 1fr;">
+        <div class="field">
+          <label for="attendanceDate">Date</label>
+          <input type="date" id="attendanceDate">
+        </div>
+        <div class="field">
+          <label>&nbsp;</label>
+          <button class="btn-confirm" id="loadAttendanceBtn" style="width:100%;">Load / Refresh</button>
+        </div>
+      </div>
+      <div id="attendanceList"><div class="loading">Add an employee first…</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Monthly Payroll Summary</div>
+      <div class="meta-row" style="grid-template-columns:1fr 1fr;">
+        <div class="field">
+          <label for="payrollMonth">Month</label>
+          <input type="month" id="payrollMonth">
+        </div>
+        <div class="field">
+          <label>&nbsp;</label>
+          <button class="btn-confirm" id="loadPayrollBtn" style="width:100%;">Calculate</button>
+        </div>
+      </div>
+      <div id="payrollSummary"><div class="loading">Choose a month and calculate…</div></div>
+    </div>
+
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- Bottom app-style tab bar -->
+<nav class="bottom-nav">
+  <button class="nav-btn active" data-tab="estimate">
+    <span class="nav-icon">🧾</span><span>Estimate</span>
+  </button>
+  <button class="nav-btn" data-tab="payroll">
+    <span class="nav-icon">👥</span><span>Payroll</span>
+  </button>
+</nav>
+
+<script src="/js/app.js"></script>
+</body>
+</html>
