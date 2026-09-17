@@ -9,8 +9,7 @@ Then open http://localhost:5000
 """
 import os
 import sqlite3
-import calendar
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, g, send_from_directory
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +19,29 @@ app = Flask(__name__, static_folder="static", static_url_path="")
 
 WOOD_TYPES = ["teak", "sal", "bija", "khamhar", "others"]
 DEFAULT_RATES = {"teak": 6000, "sal": 2200, "bija": 2500, "khamhar": 2800, "others": 1100}
+
+# Ready-made items catalog. Takhat sizes have known fixed prices; frame sizes
+# are offered as quick picks but the shop enters the price at sale time
+# (plus a "Custom size" option for anything not listed).
+READYMADE_CATALOG = {
+    "takhat": {
+        "label": "Takhat",
+        "sizes": [
+            {"label": "6ft x 3ft", "price": 2000},
+            {"label": "6ft x 4ft", "price": 2500},
+        ],
+    },
+    "frame": {
+        "label": "Wooden Frame",
+        "sizes": [
+            {"label": "3ft x 2ft", "price": None},
+            {"label": "4ft x 2.5ft", "price": None},
+            {"label": "4ft x 3ft", "price": None},
+            {"label": "5ft x 3ft", "price": None},
+            {"label": "Custom size", "price": None},
+        ],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +88,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS estimate_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             estimate_id INTEGER NOT NULL REFERENCES estimates(id),
+            item_type TEXT NOT NULL DEFAULT 'custom',
             name TEXT,
-            wood TEXT NOT NULL,
+            size_label TEXT DEFAULT '',
+            wood TEXT NOT NULL DEFAULT '',
             rate REAL NOT NULL,
             qty INTEGER NOT NULL,
             len_ft REAL DEFAULT 0, len_in REAL DEFAULT 0,
@@ -94,7 +118,7 @@ def init_db():
             name TEXT NOT NULL,
             phone TEXT,
             role TEXT,
-            monthly_salary REAL NOT NULL DEFAULT 0,
+            daily_wage REAL NOT NULL DEFAULT 0,
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         );
@@ -106,8 +130,42 @@ def init_db():
             status TEXT NOT NULL CHECK(status IN ('present','absent','half')),
             UNIQUE(employee_id, date)
         );
+
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL REFERENCES employees(id),
+            week_start TEXT NOT NULL,
+            amount REAL NOT NULL,
+            note TEXT,
+            paid_on TEXT NOT NULL
+        );
         """
     )
+
+    # --- migration: older deployments had employees.monthly_salary instead
+    # of daily_wage. Add the new column and backfill a sensible daily rate
+    # (monthly ÷ 30) so existing employee records aren't lost.
+    cols = [r[1] for r in db.execute("PRAGMA table_info(employees)").fetchall()]
+    if "daily_wage" not in cols:
+        db.execute("ALTER TABLE employees ADD COLUMN daily_wage REAL NOT NULL DEFAULT 0")
+    if "monthly_salary" in cols:
+        db.execute(
+            "UPDATE employees SET daily_wage = ROUND(monthly_salary / 30.0, 2) "
+            "WHERE (daily_wage IS NULL OR daily_wage = 0) AND monthly_salary > 0"
+        )
+        try:
+            db.execute("ALTER TABLE employees DROP COLUMN monthly_salary")
+        except sqlite3.OperationalError:
+            pass  # older SQLite without DROP COLUMN support — harmless to leave the column
+
+    # --- migration: estimate_items gained item_type/size_label to support
+    # fixed-price ready-made items (takhat, frames) alongside CFT-based pieces.
+    item_cols = [r[1] for r in db.execute("PRAGMA table_info(estimate_items)").fetchall()]
+    if "item_type" not in item_cols:
+        db.execute("ALTER TABLE estimate_items ADD COLUMN item_type TEXT NOT NULL DEFAULT 'custom'")
+    if "size_label" not in item_cols:
+        db.execute("ALTER TABLE estimate_items ADD COLUMN size_label TEXT DEFAULT ''")
+
     for wood, rate in DEFAULT_RATES.items():
         db.execute(
             "INSERT OR IGNORE INTO rates (wood, rate) VALUES (?, ?)", (wood, rate)
@@ -155,6 +213,14 @@ def set_rate(wood):
 
 
 # ---------------------------------------------------------------------------
+# Ready-made items catalog (takhat, frames, ...)
+# ---------------------------------------------------------------------------
+@app.route("/api/readymade-catalog", methods=["GET"])
+def get_readymade_catalog():
+    return jsonify(READYMADE_CATALOG)
+
+
+# ---------------------------------------------------------------------------
 # Estimates (create with items, in one call)
 # ---------------------------------------------------------------------------
 @app.route("/api/estimates", methods=["POST"])
@@ -183,13 +249,18 @@ def create_estimate():
     estimate_id = cur.lastrowid
 
     for it in items:
+        item_type = it.get("item_type", "custom")
+        if item_type not in ("custom", "readymade"):
+            item_type = "custom"
         db.execute(
             """INSERT INTO estimate_items
-               (estimate_id, name, wood, rate, qty, len_ft, len_in, wid_ft, wid_in, hgt_ft, hgt_in)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (estimate_id, item_type, name, size_label, wood, rate, qty, len_ft, len_in, wid_ft, wid_in, hgt_ft, hgt_in)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 estimate_id,
+                item_type,
                 it.get("name", ""),
+                it.get("size_label", ""),
                 it.get("wood", "others"),
                 float(it.get("rate", 0)),
                 int(it.get("qty", 1)),
@@ -219,12 +290,20 @@ def _estimate_payload(db, estimate_id):
     subtotal = 0
     total_cft = 0
     for it in items:
-        cft = _cft(it) * it["qty"]
-        cost = cft * it["rate"]
+        item_type = it["item_type"] or "custom"
+        if item_type == "readymade":
+            # Fixed-price item: cost is simply qty x price, no volume involved.
+            cft = 0
+            cost = it["qty"] * it["rate"]
+        else:
+            cft = _cft(it) * it["qty"]
+            cost = cft * it["rate"]
+            total_cft += cft
         subtotal += cost
-        total_cft += cft
         item_list.append({
-            "name": it["name"], "wood": it["wood"], "rate": it["rate"], "qty": it["qty"],
+            "item_type": item_type,
+            "name": it["name"], "size_label": it["size_label"] or "",
+            "wood": it["wood"], "rate": it["rate"], "qty": it["qty"],
             "len_ft": it["len_ft"], "len_in": it["len_in"],
             "wid_ft": it["wid_ft"], "wid_in": it["wid_in"],
             "hgt_ft": it["hgt_ft"], "hgt_in": it["hgt_in"],
@@ -323,8 +402,8 @@ def add_employee():
         return jsonify({"error": "employee name is required"}), 400
     db = get_db()
     cur = db.execute(
-        "INSERT INTO employees (name, phone, role, monthly_salary, created_at) VALUES (?, ?, ?, ?, ?)",
-        (name, data.get("phone", ""), data.get("role", ""), float(data.get("monthly_salary", 0)), now_iso()),
+        "INSERT INTO employees (name, phone, role, daily_wage, created_at) VALUES (?, ?, ?, ?, ?)",
+        (name, data.get("phone", ""), data.get("role", ""), float(data.get("daily_wage", 0)), now_iso()),
     )
     db.commit()
     emp = db.execute("SELECT * FROM employees WHERE id=?", (cur.lastrowid,)).fetchone()
@@ -336,9 +415,9 @@ def update_employee(emp_id):
     data = request.get_json(force=True)
     db = get_db()
     db.execute(
-        "UPDATE employees SET name=?, phone=?, role=?, monthly_salary=? WHERE id=?",
+        "UPDATE employees SET name=?, phone=?, role=?, daily_wage=? WHERE id=?",
         (data.get("name"), data.get("phone", ""), data.get("role", ""),
-         float(data.get("monthly_salary", 0)), emp_id),
+         float(data.get("daily_wage", 0)), emp_id),
     )
     db.commit()
     emp = db.execute("SELECT * FROM employees WHERE id=?", (emp_id,)).fetchone()
@@ -392,14 +471,22 @@ def get_attendance():
 
 
 # ---------------------------------------------------------------------------
-# Payroll — monthly salary summary
+# Payroll — weekly wage summary & payments
 # ---------------------------------------------------------------------------
+def week_range(any_date_str):
+    """Given any YYYY-MM-DD, return (monday, sunday) as date objects for that ISO week."""
+    d = datetime.strptime(any_date_str, "%Y-%m-%d").date()
+    monday = d - timedelta(days=d.isoweekday() - 1)
+    sunday = monday + timedelta(days=6)
+    return monday, sunday
+
+
 @app.route("/api/payroll/summary", methods=["GET"])
 def payroll_summary():
-    """?month=YYYY-MM"""
-    month = request.args.get("month") or datetime.now().strftime("%Y-%m")
-    year, mon = [int(x) for x in month.split("-")]
-    days_in_month = calendar.monthrange(year, mon)[1]
+    """?week=YYYY-MM-DD  (any date inside the target week; defaults to today)"""
+    week_date = request.args.get("week") or datetime.now().strftime("%Y-%m-%d")
+    monday, sunday = week_range(week_date)
+    monday_s, sunday_s = monday.isoformat(), sunday.isoformat()
 
     db = get_db()
     employees = db.execute("SELECT * FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE").fetchall()
@@ -407,25 +494,75 @@ def payroll_summary():
     summary = []
     for emp in employees:
         rows = db.execute(
-            "SELECT status FROM attendance WHERE employee_id=? AND date LIKE ?",
-            (emp["id"], f"{month}%"),
+            "SELECT status FROM attendance WHERE employee_id=? AND date BETWEEN ? AND ?",
+            (emp["id"], monday_s, sunday_s),
         ).fetchall()
         present_days = sum(1 if r["status"] == "present" else 0.5 if r["status"] == "half" else 0 for r in rows)
-        marked_days = len(rows)
-        per_day = emp["monthly_salary"] / days_in_month if days_in_month else 0
-        earned = round(per_day * present_days, 2)
+        earned = round(emp["daily_wage"] * present_days, 2)
+
+        paid_row = db.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE employee_id=? AND week_start=?",
+            (emp["id"], monday_s),
+        ).fetchone()
+        paid = paid_row["total"] or 0
+
         summary.append({
             "employee_id": emp["id"],
             "name": emp["name"],
             "role": emp["role"],
-            "monthly_salary": emp["monthly_salary"],
-            "days_in_month": days_in_month,
-            "marked_days": marked_days,
+            "daily_wage": emp["daily_wage"],
             "present_days": present_days,
-            "per_day_rate": round(per_day, 2),
+            "marked_days": len(rows),
             "earned": earned,
+            "paid": round(paid, 2),
+            "balance": round(earned - paid, 2),
         })
-    return jsonify({"month": month, "days_in_month": days_in_month, "employees": summary})
+    return jsonify({"week_start": monday_s, "week_end": sunday_s, "employees": summary})
+
+
+@app.route("/api/payments", methods=["POST"])
+def record_payment():
+    data = request.get_json(force=True)
+    employee_id = data.get("employee_id")
+    week_start = data.get("week_start")
+    amount = float(data.get("amount", 0))
+    if not employee_id or not week_start or amount <= 0:
+        return jsonify({"error": "employee_id, week_start, and a positive amount are required"}), 400
+    db = get_db()
+    cur = db.execute(
+        "INSERT INTO payments (employee_id, week_start, amount, note, paid_on) VALUES (?, ?, ?, ?, ?)",
+        (employee_id, week_start, amount, data.get("note", ""), now_iso()),
+    )
+    db.commit()
+    row = db.execute("SELECT * FROM payments WHERE id=?", (cur.lastrowid,)).fetchone()
+    return jsonify(dict(row)), 201
+
+
+@app.route("/api/payments/<int:payment_id>", methods=["DELETE"])
+def delete_payment(payment_id):
+    db = get_db()
+    db.execute("DELETE FROM payments WHERE id=?", (payment_id,))
+    db.commit()
+    return jsonify({"deleted": True})
+
+
+@app.route("/api/payments", methods=["GET"])
+def list_payments():
+    """?week_start=YYYY-MM-DD&employee_id="""
+    week_start = request.args.get("week_start")
+    employee_id = request.args.get("employee_id")
+    db = get_db()
+    query = "SELECT * FROM payments WHERE 1=1"
+    params = []
+    if week_start:
+        query += " AND week_start=?"
+        params.append(week_start)
+    if employee_id:
+        query += " AND employee_id=?"
+        params.append(employee_id)
+    query += " ORDER BY paid_on DESC"
+    rows = db.execute(query, params).fetchall()
+    return jsonify([dict(r) for r in rows])
 
 
 # ---------------------------------------------------------------------------
