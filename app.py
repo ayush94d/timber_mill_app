@@ -1,21 +1,31 @@
 """
-Awadh Saw Mill — backend
-Flask + SQLite. Serves the frontend (static/) and a JSON API under /api/*.
+Awadh Saw Mill — backend (Render or Vercel, with a Neon Postgres database)
+
+Flask app exposing /api/* as a JSON API.
+  * On Render (or when run locally) Flask also serves the frontend from /public.
+  * On Vercel, Vercel serves /public itself and only runs this for /api/*.
+
+Requires an environment variable DATABASE_URL pointing to a Postgres database
+(Neon's *pooled* connection string — the host contains "-pooler" — is best).
 
 Run locally:
+    export DATABASE_URL="postgresql://user:pass@host/db?sslmode=require"
     pip install -r requirements.txt
-    python app.py
-Then open http://localhost:5000
+    python app.py            # then open http://localhost:5000
+
+Render start command:
+    gunicorn app:app
 """
 import os
-import sqlite3
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, g, send_from_directory
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "awadh.db")
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from flask import Flask, request, jsonify, g
 
-app = Flask(__name__, static_folder="static", static_url_path="")
+# static_folder=public + empty url path => /css/style.css, /js/app.js etc. are served
+# straight from the public/ folder (used on Render; Vercel serves these itself).
+app = Flask(__name__, static_folder="public", static_url_path="")
 
 WOOD_TYPES = ["teak", "sal", "bija", "khamhar", "others"]
 DEFAULT_RATES = {"teak": 6000, "sal": 2200, "bija": 2500, "khamhar": 2800, "others": 1100}
@@ -47,11 +57,40 @@ READYMADE_CATALOG = {
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
+def _database_url():
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Add it in your host's Environment settings "
+            "(use your Neon connection string, the one with -pooler in the host name)."
+        )
+    return url
+
+
+class Db:
+    """Thin wrapper so call sites can keep using db.execute(...).fetchone()/
+    .fetchall(), the same convenience pattern sqlite3.Connection offered,
+    on top of psycopg2 (which normally requires a separate cursor)."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, query, params=None):
+        cur = self.conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(query, params or [])
+        return cur
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys = ON")
+        conn = psycopg2.connect(_database_url())
+        g.db = Db(conn)
     return g.db
 
 
@@ -63,30 +102,28 @@ def close_db(exception=None):
 
 
 def init_db():
-    db = sqlite3.connect(DB_PATH)
-    db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS rates (
+    conn = psycopg2.connect(_database_url())
+    cur = conn.cursor()
+
+    statements = [
+        """CREATE TABLE IF NOT EXISTS rates (
             wood TEXT PRIMARY KEY,
             rate REAL NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS customers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        )""",
+        """CREATE TABLE IF NOT EXISTS customers (
+            id SERIAL PRIMARY KEY,
             name TEXT,
             phone TEXT NOT NULL,
             created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS estimates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        )""",
+        """CREATE TABLE IF NOT EXISTS estimates (
+            id SERIAL PRIMARY KEY,
             customer_id INTEGER NOT NULL REFERENCES customers(id),
             making_charges REAL NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS estimate_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        )""",
+        """CREATE TABLE IF NOT EXISTS estimate_items (
+            id SERIAL PRIMARY KEY,
             estimate_id INTEGER NOT NULL REFERENCES estimates(id),
             item_type TEXT NOT NULL DEFAULT 'custom',
             name TEXT,
@@ -97,81 +134,72 @@ def init_db():
             len_ft REAL DEFAULT 0, len_in REAL DEFAULT 0,
             wid_ft REAL DEFAULT 0, wid_in REAL DEFAULT 0,
             hgt_ft REAL DEFAULT 0, hgt_in REAL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS challans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        )""",
+        """CREATE TABLE IF NOT EXISTS challans (
+            id SERIAL PRIMARY KEY,
             estimate_id INTEGER NOT NULL REFERENCES estimates(id),
             challan_number TEXT UNIQUE NOT NULL,
             advance_paid REAL NOT NULL DEFAULT 0,
             delivery_date TEXT,
             created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS challan_counters (
+        )""",
+        """CREATE TABLE IF NOT EXISTS challan_counters (
             date_key TEXT PRIMARY KEY,
             counter INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS employees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        )""",
+        """CREATE TABLE IF NOT EXISTS employees (
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             phone TEXT,
             role TEXT,
+            wage_type TEXT NOT NULL DEFAULT 'daily',
             daily_wage REAL NOT NULL DEFAULT 0,
+            hourly_wage DOUBLE PRECISION NOT NULL DEFAULT 0,
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS attendance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        )""",
+        """CREATE TABLE IF NOT EXISTS attendance (
+            id SERIAL PRIMARY KEY,
             employee_id INTEGER NOT NULL REFERENCES employees(id),
             date TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('present','absent','half')),
+            hours DOUBLE PRECISION NOT NULL DEFAULT 0,
             UNIQUE(employee_id, date)
-        );
-
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        )""",
+        # NOTE: the table is called "payments" for historical reasons; each row
+        # is an advance taken by an employee on `date`.
+        """CREATE TABLE IF NOT EXISTS payments (
+            id SERIAL PRIMARY KEY,
             employee_id INTEGER NOT NULL REFERENCES employees(id),
             week_start TEXT NOT NULL,
+            date TEXT,
             amount REAL NOT NULL,
             note TEXT,
             paid_on TEXT NOT NULL
-        );
-        """
-    )
+        )""",
+    ]
+    # One transaction-scoped lock so two cold starts never run the DDL at the
+    # same time (works with Neon's pooled connections, unlike session locks).
+    cur.execute("SELECT pg_advisory_xact_lock(727274)")
 
-    # --- migration: older deployments had employees.monthly_salary instead
-    # of daily_wage. Add the new column and backfill a sensible daily rate
-    # (monthly ÷ 30) so existing employee records aren't lost.
-    cols = [r[1] for r in db.execute("PRAGMA table_info(employees)").fetchall()]
-    if "daily_wage" not in cols:
-        db.execute("ALTER TABLE employees ADD COLUMN daily_wage REAL NOT NULL DEFAULT 0")
-    if "monthly_salary" in cols:
-        db.execute(
-            "UPDATE employees SET daily_wage = ROUND(monthly_salary / 30.0, 2) "
-            "WHERE (daily_wage IS NULL OR daily_wage = 0) AND monthly_salary > 0"
-        )
-        try:
-            db.execute("ALTER TABLE employees DROP COLUMN monthly_salary")
-        except sqlite3.OperationalError:
-            pass  # older SQLite without DROP COLUMN support — harmless to leave the column
+    for stmt in statements:
+        cur.execute(stmt)
 
-    # --- migration: estimate_items gained item_type/size_label to support
-    # fixed-price ready-made items (takhat, frames) alongside CFT-based pieces.
-    item_cols = [r[1] for r in db.execute("PRAGMA table_info(estimate_items)").fetchall()]
-    if "item_type" not in item_cols:
-        db.execute("ALTER TABLE estimate_items ADD COLUMN item_type TEXT NOT NULL DEFAULT 'custom'")
-    if "size_label" not in item_cols:
-        db.execute("ALTER TABLE estimate_items ADD COLUMN size_label TEXT DEFAULT ''")
+    # --- migrations for databases created by earlier versions (safe to repeat) ---
+    cur.execute("ALTER TABLE employees ADD COLUMN IF NOT EXISTS wage_type TEXT NOT NULL DEFAULT 'daily'")
+    cur.execute("ALTER TABLE employees ADD COLUMN IF NOT EXISTS hourly_wage DOUBLE PRECISION NOT NULL DEFAULT 0")
+    cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS hours DOUBLE PRECISION NOT NULL DEFAULT 0")
+    cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS date TEXT")
+    cur.execute("UPDATE payments SET date = LEFT(paid_on, 10) WHERE date IS NULL")
 
     for wood, rate in DEFAULT_RATES.items():
-        db.execute(
-            "INSERT OR IGNORE INTO rates (wood, rate) VALUES (?, ?)", (wood, rate)
+        cur.execute(
+            "INSERT INTO rates (wood, rate) VALUES (%s, %s) ON CONFLICT (wood) DO NOTHING",
+            (wood, rate),
         )
-    db.commit()
-    db.close()
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
 def now_iso():
@@ -179,11 +207,17 @@ def now_iso():
 
 
 # ---------------------------------------------------------------------------
-# Frontend
+# Frontend (used on Render / local; Vercel serves public/ on its own)
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return send_from_directory(app.static_folder, "index.html")
+    return app.send_static_file("index.html")
+
+
+@app.route("/healthz")
+def healthz():
+    """Lightweight check for uptime pings; does not touch the database."""
+    return jsonify({"status": "ok"})
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +238,8 @@ def set_rate(wood):
     rate = float(data.get("rate", 0))
     db = get_db()
     db.execute(
-        "INSERT INTO rates (wood, rate) VALUES (?, ?) "
-        "ON CONFLICT(wood) DO UPDATE SET rate=excluded.rate",
+        "INSERT INTO rates (wood, rate) VALUES (%s, %s) "
+        "ON CONFLICT (wood) DO UPDATE SET rate = excluded.rate",
         (wood, rate),
     )
     db.commit()
@@ -237,16 +271,16 @@ def create_estimate():
 
     db = get_db()
     cur = db.execute(
-        "INSERT INTO customers (name, phone, created_at) VALUES (?, ?, ?)",
+        "INSERT INTO customers (name, phone, created_at) VALUES (%s, %s, %s) RETURNING id",
         (name, phone, now_iso()),
     )
-    customer_id = cur.lastrowid
+    customer_id = cur.fetchone()["id"]
 
     cur = db.execute(
-        "INSERT INTO estimates (customer_id, making_charges, created_at) VALUES (?, ?, ?)",
+        "INSERT INTO estimates (customer_id, making_charges, created_at) VALUES (%s, %s, %s) RETURNING id",
         (customer_id, making_charges, now_iso()),
     )
-    estimate_id = cur.lastrowid
+    estimate_id = cur.fetchone()["id"]
 
     for it in items:
         item_type = it.get("item_type", "custom")
@@ -255,7 +289,7 @@ def create_estimate():
         db.execute(
             """INSERT INTO estimate_items
                (estimate_id, item_type, name, size_label, wood, rate, qty, len_ft, len_in, wid_ft, wid_in, hgt_ft, hgt_in)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 estimate_id,
                 item_type,
@@ -280,11 +314,11 @@ def _cft(item):
 
 
 def _estimate_payload(db, estimate_id):
-    est = db.execute("SELECT * FROM estimates WHERE id=?", (estimate_id,)).fetchone()
+    est = db.execute("SELECT * FROM estimates WHERE id=%s", (estimate_id,)).fetchone()
     if not est:
         return None
-    customer = db.execute("SELECT * FROM customers WHERE id=?", (est["customer_id"],)).fetchone()
-    items = db.execute("SELECT * FROM estimate_items WHERE estimate_id=?", (estimate_id,)).fetchall()
+    customer = db.execute("SELECT * FROM customers WHERE id=%s", (est["customer_id"],)).fetchone()
+    items = db.execute("SELECT * FROM estimate_items WHERE estimate_id=%s", (estimate_id,)).fetchall()
 
     item_list = []
     subtotal = 0
@@ -310,7 +344,7 @@ def _estimate_payload(db, estimate_id):
             "cft": round(cft, 3), "cost": round(cost, 2),
         })
 
-    challan = db.execute("SELECT * FROM challans WHERE estimate_id=?", (estimate_id,)).fetchone()
+    challan = db.execute("SELECT * FROM challans WHERE estimate_id=%s", (estimate_id,)).fetchone()
 
     return {
         "id": est["id"],
@@ -355,27 +389,27 @@ def create_challan(estimate_id):
     delivery_date = data.get("delivery_date")
 
     db = get_db()
-    existing = db.execute("SELECT * FROM challans WHERE estimate_id=?", (estimate_id,)).fetchone()
+    existing = db.execute("SELECT * FROM challans WHERE estimate_id=%s", (estimate_id,)).fetchone()
     if existing:
         db.execute(
-            "UPDATE challans SET advance_paid=?, delivery_date=? WHERE id=?",
+            "UPDATE challans SET advance_paid=%s, delivery_date=%s WHERE id=%s",
             (advance_paid, delivery_date, existing["id"]),
         )
         db.commit()
         return jsonify(_estimate_payload(db, estimate_id))
 
     date_key = datetime.now().strftime("%Y%m%d")
-    row = db.execute("SELECT counter FROM challan_counters WHERE date_key=?", (date_key,)).fetchone()
+    row = db.execute("SELECT counter FROM challan_counters WHERE date_key=%s", (date_key,)).fetchone()
     next_no = (row["counter"] + 1) if row else 1
     db.execute(
-        "INSERT INTO challan_counters (date_key, counter) VALUES (?, ?) "
-        "ON CONFLICT(date_key) DO UPDATE SET counter=excluded.counter",
+        "INSERT INTO challan_counters (date_key, counter) VALUES (%s, %s) "
+        "ON CONFLICT (date_key) DO UPDATE SET counter = excluded.counter",
         (date_key, next_no),
     )
     challan_number = f"CH-{date_key}-{next_no:03d}"
     db.execute(
         "INSERT INTO challans (estimate_id, challan_number, advance_paid, delivery_date, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "VALUES (%s, %s, %s, %s, %s)",
         (estimate_id, challan_number, advance_paid, delivery_date, now_iso()),
     )
     db.commit()
@@ -383,13 +417,25 @@ def create_challan(estimate_id):
 
 
 # ---------------------------------------------------------------------------
-# Payroll — employees
+# Payroll — employees (daily-wage or hourly-wage)
 # ---------------------------------------------------------------------------
+def _parse_wage(data):
+    """Returns (wage_type, daily_wage, hourly_wage) from a request body.
+    Accepts {wage_type, wage}; the single `wage` value goes to the matching rate."""
+    wage_type = data.get("wage_type", "daily")
+    if wage_type not in ("daily", "hourly"):
+        raise ValueError("wage_type must be 'daily' or 'hourly'")
+    wage = float(data.get("wage", data.get("daily_wage", 0)) or 0)
+    if wage < 0:
+        raise ValueError("wage cannot be negative")
+    return wage_type, (wage if wage_type == "daily" else 0.0), (wage if wage_type == "hourly" else 0.0)
+
+
 @app.route("/api/employees", methods=["GET"])
 def list_employees():
     db = get_db()
     rows = db.execute(
-        "SELECT * FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE"
+        "SELECT * FROM employees WHERE active=1 ORDER BY LOWER(name)"
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -400,27 +446,37 @@ def add_employee():
     name = (data.get("name") or "").strip()
     if not name:
         return jsonify({"error": "employee name is required"}), 400
+    try:
+        wage_type, daily_wage, hourly_wage = _parse_wage(data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     db = get_db()
     cur = db.execute(
-        "INSERT INTO employees (name, phone, role, daily_wage, created_at) VALUES (?, ?, ?, ?, ?)",
-        (name, data.get("phone", ""), data.get("role", ""), float(data.get("daily_wage", 0)), now_iso()),
+        "INSERT INTO employees (name, phone, role, wage_type, daily_wage, hourly_wage, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *",
+        (name, data.get("phone", ""), data.get("role", ""), wage_type, daily_wage, hourly_wage, now_iso()),
     )
+    emp = cur.fetchone()
     db.commit()
-    emp = db.execute("SELECT * FROM employees WHERE id=?", (cur.lastrowid,)).fetchone()
     return jsonify(dict(emp)), 201
 
 
 @app.route("/api/employees/<int:emp_id>", methods=["PUT"])
 def update_employee(emp_id):
     data = request.get_json(force=True)
+    try:
+        wage_type, daily_wage, hourly_wage = _parse_wage(data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     db = get_db()
-    db.execute(
-        "UPDATE employees SET name=?, phone=?, role=?, daily_wage=? WHERE id=?",
+    cur = db.execute(
+        "UPDATE employees SET name=%s, phone=%s, role=%s, wage_type=%s, daily_wage=%s, hourly_wage=%s "
+        "WHERE id=%s RETURNING *",
         (data.get("name"), data.get("phone", ""), data.get("role", ""),
-         float(data.get("daily_wage", 0)), emp_id),
+         wage_type, daily_wage, hourly_wage, emp_id),
     )
+    emp = cur.fetchone()
     db.commit()
-    emp = db.execute("SELECT * FROM employees WHERE id=?", (emp_id,)).fetchone()
     if not emp:
         return jsonify({"error": "not found"}), 404
     return jsonify(dict(emp))
@@ -429,30 +485,46 @@ def update_employee(emp_id):
 @app.route("/api/employees/<int:emp_id>", methods=["DELETE"])
 def remove_employee(emp_id):
     db = get_db()
-    db.execute("UPDATE employees SET active=0 WHERE id=?", (emp_id,))
+    db.execute("UPDATE employees SET active=0 WHERE id=%s", (emp_id,))
     db.commit()
     return jsonify({"deleted": True})
 
 
 # ---------------------------------------------------------------------------
 # Payroll — attendance
+#   daily employees : status = present / half / absent
+#   hourly employees: send `hours` (0 - 24); status is derived from it
 # ---------------------------------------------------------------------------
 @app.route("/api/attendance", methods=["POST"])
 def mark_attendance():
     data = request.get_json(force=True)
     employee_id = data.get("employee_id")
     date = data.get("date")
-    status = data.get("status")
-    if status not in ("present", "absent", "half"):
-        return jsonify({"error": "status must be present, absent, or half"}), 400
+    if not employee_id or not date:
+        return jsonify({"error": "employee_id and date are required"}), 400
+
+    if data.get("hours") is not None:
+        try:
+            hours = float(data["hours"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "hours must be a number"}), 400
+        if hours < 0 or hours > 24:
+            return jsonify({"error": "hours must be between 0 and 24"}), 400
+        status = "present" if hours > 0 else "absent"
+    else:
+        hours = 0.0
+        status = data.get("status")
+        if status not in ("present", "absent", "half"):
+            return jsonify({"error": "status must be present, absent, or half"}), 400
+
     db = get_db()
     db.execute(
-        "INSERT INTO attendance (employee_id, date, status) VALUES (?, ?, ?) "
-        "ON CONFLICT(employee_id, date) DO UPDATE SET status=excluded.status",
-        (employee_id, date, status),
+        "INSERT INTO attendance (employee_id, date, status, hours) VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (employee_id, date) DO UPDATE SET status = excluded.status, hours = excluded.hours",
+        (employee_id, date, status, hours),
     )
     db.commit()
-    return jsonify({"employee_id": employee_id, "date": date, "status": status})
+    return jsonify({"employee_id": employee_id, "date": date, "status": status, "hours": hours})
 
 
 @app.route("/api/attendance", methods=["GET"])
@@ -461,17 +533,17 @@ def get_attendance():
     month = request.args.get("month")
     employee_id = request.args.get("employee_id")
     db = get_db()
-    query = "SELECT * FROM attendance WHERE date LIKE ?"
+    query = "SELECT * FROM attendance WHERE date LIKE %s"
     params = [f"{month}%"]
     if employee_id:
-        query += " AND employee_id=?"
+        query += " AND employee_id=%s"
         params.append(employee_id)
     rows = db.execute(query, params).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
 # ---------------------------------------------------------------------------
-# Payroll — weekly wage summary & payments
+# Payroll — advances (money an employee takes during the week)
 # ---------------------------------------------------------------------------
 def week_range(any_date_str):
     """Given any YYYY-MM-DD, return (monday, sunday) as date objects for that ISO week."""
@@ -481,95 +553,137 @@ def week_range(any_date_str):
     return monday, sunday
 
 
+@app.route("/api/advances", methods=["POST"])
+def add_advance():
+    data = request.get_json(force=True)
+    try:
+        employee_id = int(data.get("employee_id"))
+        amount = float(data.get("amount", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "employee_id and amount are required"}), 400
+    date = data.get("date") or datetime.now().strftime("%Y-%m-%d")
+    try:
+        monday, _ = week_range(date)
+    except ValueError:
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    if amount <= 0:
+        return jsonify({"error": "amount must be greater than 0"}), 400
+
+    db = get_db()
+    emp = db.execute("SELECT id FROM employees WHERE id=%s AND active=1", (employee_id,)).fetchone()
+    if not emp:
+        return jsonify({"error": "employee not found"}), 404
+    cur = db.execute(
+        "INSERT INTO payments (employee_id, week_start, date, amount, note, paid_on) "
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+        (employee_id, monday.isoformat(), date, amount, (data.get("note") or "").strip(), now_iso()),
+    )
+    row = cur.fetchone()
+    db.commit()
+    return jsonify(dict(row)), 201
+
+
+@app.route("/api/advances", methods=["GET"])
+def list_advances():
+    """?employee_id=  &limit=50   — newest first, with the employee's name."""
+    employee_id = request.args.get("employee_id")
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 200))
+    except ValueError:
+        limit = 50
+    db = get_db()
+    query = (
+        "SELECT p.id, p.employee_id, e.name AS employee_name, p.date, p.amount, p.note "
+        "FROM payments p JOIN employees e ON e.id = p.employee_id"
+    )
+    params = []
+    if employee_id:
+        query += " WHERE p.employee_id=%s"
+        params.append(employee_id)
+    query += " ORDER BY p.date DESC, p.id DESC LIMIT %s"
+    params.append(limit)
+    rows = db.execute(query, params).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/advances/<int:advance_id>", methods=["DELETE"])
+def delete_advance(advance_id):
+    db = get_db()
+    db.execute("DELETE FROM payments WHERE id=%s", (advance_id,))
+    db.commit()
+    return jsonify({"deleted": True})
+
+
+# ---------------------------------------------------------------------------
+# Payroll — weekly summary:  earned  -  advances taken that week  =  amount due
+# ---------------------------------------------------------------------------
 @app.route("/api/payroll/summary", methods=["GET"])
 def payroll_summary():
     """?week=YYYY-MM-DD  (any date inside the target week; defaults to today)"""
     week_date = request.args.get("week") or datetime.now().strftime("%Y-%m-%d")
-    monday, sunday = week_range(week_date)
+    try:
+        monday, sunday = week_range(week_date)
+    except ValueError:
+        return jsonify({"error": "week must be YYYY-MM-DD"}), 400
     monday_s, sunday_s = monday.isoformat(), sunday.isoformat()
 
     db = get_db()
-    employees = db.execute("SELECT * FROM employees WHERE active=1 ORDER BY name COLLATE NOCASE").fetchall()
+    employees = db.execute("SELECT * FROM employees WHERE active=1 ORDER BY LOWER(name)").fetchall()
 
     summary = []
     for emp in employees:
         rows = db.execute(
-            "SELECT status FROM attendance WHERE employee_id=? AND date BETWEEN ? AND ?",
+            "SELECT status, hours FROM attendance WHERE employee_id=%s AND date BETWEEN %s AND %s",
             (emp["id"], monday_s, sunday_s),
         ).fetchall()
-        present_days = sum(1 if r["status"] == "present" else 0.5 if r["status"] == "half" else 0 for r in rows)
-        earned = round(emp["daily_wage"] * present_days, 2)
 
-        paid_row = db.execute(
-            "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE employee_id=? AND week_start=?",
-            (emp["id"], monday_s),
-        ).fetchone()
-        paid = paid_row["total"] or 0
+        wage_type = emp["wage_type"] or "daily"
+        if wage_type == "hourly":
+            total_hours = round(sum(float(r["hours"] or 0) for r in rows), 2)
+            days_worked = sum(1 for r in rows if float(r["hours"] or 0) > 0)
+            earned = round(float(emp["hourly_wage"]) * total_hours, 2)
+            present_days = days_worked
+        else:
+            present_days = sum(1 if r["status"] == "present" else 0.5 if r["status"] == "half" else 0 for r in rows)
+            total_hours = 0
+            earned = round(float(emp["daily_wage"]) * present_days, 2)
+
+        adv_rows = db.execute(
+            "SELECT id, date, amount, note FROM payments "
+            "WHERE employee_id=%s AND date BETWEEN %s AND %s ORDER BY date, id",
+            (emp["id"], monday_s, sunday_s),
+        ).fetchall()
+        advances = [
+            {"id": a["id"], "date": a["date"], "amount": round(float(a["amount"]), 2), "note": a["note"] or ""}
+            for a in adv_rows
+        ]
+        advances_total = round(sum(a["amount"] for a in advances), 2)
 
         summary.append({
             "employee_id": emp["id"],
             "name": emp["name"],
             "role": emp["role"],
+            "wage_type": wage_type,
             "daily_wage": emp["daily_wage"],
+            "hourly_wage": emp["hourly_wage"],
             "present_days": present_days,
-            "marked_days": len(rows),
+            "total_hours": total_hours,
             "earned": earned,
-            "paid": round(paid, 2),
-            "balance": round(earned - paid, 2),
+            "advances": advances,
+            "advances_total": advances_total,
+            "balance": round(earned - advances_total, 2),
         })
     return jsonify({"week_start": monday_s, "week_end": sunday_s, "employees": summary})
 
 
-@app.route("/api/payments", methods=["POST"])
-def record_payment():
-    data = request.get_json(force=True)
-    employee_id = data.get("employee_id")
-    week_start = data.get("week_start")
-    amount = float(data.get("amount", 0))
-    if not employee_id or not week_start or amount <= 0:
-        return jsonify({"error": "employee_id, week_start, and a positive amount are required"}), 400
-    db = get_db()
-    cur = db.execute(
-        "INSERT INTO payments (employee_id, week_start, amount, note, paid_on) VALUES (?, ?, ?, ?, ?)",
-        (employee_id, week_start, amount, data.get("note", ""), now_iso()),
-    )
-    db.commit()
-    row = db.execute("SELECT * FROM payments WHERE id=?", (cur.lastrowid,)).fetchone()
-    return jsonify(dict(row)), 201
-
-
-@app.route("/api/payments/<int:payment_id>", methods=["DELETE"])
-def delete_payment(payment_id):
-    db = get_db()
-    db.execute("DELETE FROM payments WHERE id=?", (payment_id,))
-    db.commit()
-    return jsonify({"deleted": True})
-
-
-@app.route("/api/payments", methods=["GET"])
-def list_payments():
-    """?week_start=YYYY-MM-DD&employee_id="""
-    week_start = request.args.get("week_start")
-    employee_id = request.args.get("employee_id")
-    db = get_db()
-    query = "SELECT * FROM payments WHERE 1=1"
-    params = []
-    if week_start:
-        query += " AND week_start=?"
-        params.append(week_start)
-    if employee_id:
-        query += " AND employee_id=?"
-        params.append(employee_id)
-    query += " ORDER BY paid_on DESC"
-    rows = db.execute(query, params).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-
 # ---------------------------------------------------------------------------
+# One-time / cold-start schema setup.
+# Vercel imports this module fresh on each cold start, so this runs
+# occasionally rather than on every request — CREATE TABLE IF NOT EXISTS and
+# ON CONFLICT DO NOTHING make it safe to repeat.
+# ---------------------------------------------------------------------------
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
-else:
-    # also initialize when imported by a WSGI server (gunicorn, etc.)
-    init_db()
